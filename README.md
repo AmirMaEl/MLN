@@ -127,12 +127,11 @@ MLN/
 ## Citation
 
 ```bibtex
-@article{mln2026,
-  title   = {Prompt-Guided Image Editing with Masked Logit Nudging
-             in Visual Autoregressive Models},
-  author  = {},
-  journal = {arXiv preprint arXiv:2604.14591},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2604.14591}
+@inproceedings{el2026prompt,
+  title={Prompt-Guided Image Editing with Masked Logit Nudging in Visual Autoregressive Models},
+  author={El-Ghoussani, Amir and H{\"o}lle, Marc and Carneiro, Gustavo and Belagiannis, Vasileios},
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  pages={4810--4820},
+  year={2026}
 }
 ```
