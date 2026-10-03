@@ -1,0 +1,19 @@
+torch>=2.5.1
+torchvision
+transformers==4.46.3  # versions the results were verified with
+huggingface_hub<1
+safetensors
+sentencepiece
+protobuf
+timm==1.0.30
+einops
+numpy
+scipy
+opencv-python
+Pillow
+imageio
+pytz
+rich
+ninja  # builds HART's RMSNorm CUDA kernel (also needs nvcc)
+gradio  # demo only
+# flash-attn==2.8.3.post1 (required by Infinity) is installed by setup.sh with --no-build-isolation

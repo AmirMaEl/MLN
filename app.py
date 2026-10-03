@@ -1,196 +1,102 @@
-"""
-Gradio demo for MLN image editing.
+"""Gradio demo: pick backbone, method and resolution, upload an image, edit it.
 
-Edits an input image guided by source → target prompts using
-Masked Logit Nudging (MLN) in the Switti Visual Autoregressive model.
-"""
+  python app.py            # http://localhost:7860   (--share for a public link)
 
-import os
+Methods marked (mask) edit only the region you paint with the brush.
+One model is kept on the GPU at a time; switching method or resolution reloads.
+"""
+import argparse
+import gc
 import time
+
+import cv2
 import gradio as gr
-import torch
 import numpy as np
-from PIL import Image
+import torch
+
+from methods import METHODS, load_method
+
+LABEL = {v[0]: k for k, v in METHODS.items()}
+BACKBONES = {}
+for name, (label, backbone, _, _) in METHODS.items():
+    BACKBONES.setdefault(backbone, []).append(label)
+_loaded = {"key": None, "model": None}
 
 
-# ─── pipeline cache ───────────────────────────────────────────────────────────
-_pipe = None
-_pipe_resolution = None
+def get_model(name, reso):
+    if _loaded["key"] != (name, reso):
+        _loaded["model"] = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        _loaded.update(key=(name, reso), model=load_method(name, reso))
+    return _loaded["model"]
 
 
-def _get_pipeline(resolution: int, device: str):
-    global _pipe, _pipe_resolution
-    if _pipe is None or _pipe_resolution != resolution:
-        from edit import build_pipeline
-        _pipe = build_pipeline(resolution, device)
-        _pipe_resolution = resolution
-    return _pipe
+def square(img, reso, interp=None):
+    """Center-crop to a square and resize to reso."""
+    h, w = img.shape[:2]
+    s = min(h, w)
+    img = img[(h - s) // 2:(h - s) // 2 + s, (w - s) // 2:(w - s) // 2 + s]
+    return cv2.resize(img, (reso, reso), interpolation=interp or (cv2.INTER_CUBIC if reso > s else cv2.INTER_AREA))
 
 
-# ─── helpers ──────────────────────────────────────────────────────────────────
-
-def _pil_to_tensor(img: Image.Image, resolution: int) -> torch.Tensor:
-    img = img.convert("RGB").resize((resolution, resolution), Image.LANCZOS)
-    arr = np.array(img).astype(np.float32) / 255.0
-    t = torch.from_numpy(arr).permute(2, 0, 1)   # (3, H, W)
-    return (t * 2 - 1).unsqueeze(0)              # (1, 3, H, W) in [-1, 1]
-
-
-def _tensor_to_pil(t: torch.Tensor) -> Image.Image:
-    t = t.squeeze(0).cpu().float()
-    if t.min() < 0:
-        t = (t + 1) / 2
-    t = t.clamp(0, 1)
-    arr = (t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    return Image.fromarray(arr)
-
-
-def _side_by_side(left: Image.Image, right: Image.Image, gap: int = 8) -> Image.Image:
-    w = left.width + gap + right.width
-    h = max(left.height, right.height)
-    canvas = Image.new("RGB", (w, h), (30, 30, 30))
-    canvas.paste(left, (0, 0))
-    canvas.paste(right, (left.width + gap, 0))
-    return canvas
+def run(editor, label, reso, source_prompt, target_prompt, seed):
+    if editor is None or editor.get("background") is None:
+        raise gr.Error("Upload an image first.")
+    name, reso = LABEL[label], int(reso)
+    _, _, needs_mask, resos = METHODS[name]
+    if reso not in resos:
+        raise gr.Error(f"{label} runs at {resos[0]} px only.")
+    image = torch.from_numpy(square(editor["background"][..., :3], reso)).float().permute(2, 0, 1)[None] / 127.5 - 1
+    kwargs = {}
+    if needs_mask:
+        painted = [l[..., 3] > 0 for l in editor.get("layers") or [] if l is not None and l.shape[-1] == 4]
+        if not np.any(painted):
+            raise gr.Error("This method needs an edit mask: paint the region to edit with the brush.")
+        kwargs["mask"] = square(np.any(painted, 0).astype(np.float32), reso, cv2.INTER_NEAREST)
+    model = get_model(name, reso)
+    t = time.time()
+    out = model.edit(image, source_prompt, target_prompt, seed=int(seed), **kwargs)
+    img = (out[0].permute(1, 2, 0).float().clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+    return img, f"{label} @ {reso} px: {time.time() - t:.1f} s"
 
 
-# ─── inference ────────────────────────────────────────────────────────────────
-
-def run_edit(
-    source_image,
-    source_prompt: str,
-    target_prompt: str,
-    resolution: int,
-    gt_fix_scales: int,
-    cfg: float,
-    seed: int,
-    mask_image,
-):
-    if source_image is None:
-        return None, "Please upload a source image."
-    if not source_prompt.strip():
-        return None, "Please enter a source prompt."
-    if not target_prompt.strip():
-        return None, "Please enter a target prompt."
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if not isinstance(source_image, Image.Image):
-        source_image = Image.fromarray(source_image)
-    image_tensor = _pil_to_tensor(source_image, resolution).to(device)
-
-    mask = None
-    if mask_image is not None:
-        if not isinstance(mask_image, Image.Image):
-            mask_image = Image.fromarray(mask_image)
-        mask_np = np.array(mask_image.resize((resolution, resolution)).convert("L"))
-        mask_bin = (mask_np > 127).astype(np.float32)
-        # shape expected by invert_stepwise: (1, 1, H, W)
-        mask = torch.from_numpy(mask_bin).unsqueeze(0).unsqueeze(0).to(device)
-
-    try:
-        pipe = _get_pipeline(resolution, device)
-    except Exception as exc:
-        return None, f"Failed to load pipeline: {exc}"
-
-    try:
-        result = pipe.invert_stepwise(
-            image_B3HW=image_tensor,
-            prompt=source_prompt,
-            eprompt=target_prompt,
-            seed=int(seed),
-            cfg=cfg,
-            gt_fix_scales=int(gt_fix_scales),
-            mask=mask,
-            visualize=False,
-        )
-    except Exception as exc:
-        return None, f"Error during editing: {exc}"
-
-    # fhats: (N_scales, B, 3, H, W) — last entry is the final output
-    edited_pil = _tensor_to_pil(result["fhats"][-1])
-
-    os.makedirs("output", exist_ok=True)
-    out_path = f"output/edit_{int(time.time())}.png"
-    edited_pil.save(out_path)
-
-    src_resized = source_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS)
-    comparison = _side_by_side(src_resized, edited_pil)
-
-    return comparison, f"Saved to {out_path}"
+def on_backbone(backbone):
+    labels = BACKBONES[backbone]
+    return gr.update(choices=labels, value=labels[0]), on_method(labels[0])
 
 
-# ─── UI ───────────────────────────────────────────────────────────────────────
+def on_method(label):
+    resos = METHODS[LABEL[label]][3]
+    return gr.update(choices=[str(r) for r in resos], value=str(resos[0]))
 
-with gr.Blocks(title="MLN Image Editing") as demo:
-    gr.Markdown(
-        "## MLN Image Editing\n"
-        "Edit images using **Masked Logit Nudging** (MLN) in the Switti VAR model."
-    )
 
+with gr.Blocks(title="VAR image editing") as demo:
+    gr.Markdown("## Training-free image editing with next-scale AR models\n"
+                "Upload an image, describe it (source) and the edit (target). "
+                "Methods marked *(mask)* edit only the region you paint with the brush.")
     with gr.Row():
-        # ── inputs ────────────────────────────────────────────────────────────
-        with gr.Column(scale=1):
-            src_img = gr.Image(label="Source Image", type="pil")
-            src_prompt = gr.Textbox(
-                label="Source Prompt",
-                placeholder="a photo of a dog",
-            )
-            tgt_prompt = gr.Textbox(
-                label="Target Prompt",
-                placeholder="a photo of a cat",
-            )
-
-            with gr.Row():
-                resolution = gr.Radio(
-                    choices=[512, 1024],
-                    value=512,
-                    label="Resolution",
-                )
-                seed = gr.Number(value=42, precision=0, label="Seed")
-
-            gt_fix = gr.Slider(
-                minimum=0,
-                maximum=9,
-                step=1,
-                value=2,
-                label="GT Fix Scales",
-                info=(
-                    "Number of leading VAR scales seeded directly from the "
-                    "ground-truth image tokens before the transformer runs. "
-                    "0 = transformer handles all scales freely; "
-                    "higher values preserve more coarse structure."
-                ),
-            )
-            cfg_scale = gr.Slider(
-                minimum=1.0,
-                maximum=20.0,
-                step=0.5,
-                value=8.0,
-                label="CFG Scale",
-                info="Classifier-free guidance strength.",
-            )
-            mask_img = gr.Image(
-                label="Binary Mask (optional)",
-                type="pil",
-            )
-            gr.Markdown(
-                "_Upload a black-and-white image as a mask. "
-                "White regions are treated as the edit area._"
-            )
-            run_btn = gr.Button("Edit", variant="primary")
-
-        # ── outputs ───────────────────────────────────────────────────────────
-        with gr.Column(scale=1):
-            output_img = gr.Image(label="Source  |  Edited")
-            status_box = gr.Textbox(label="Status", interactive=False)
-
-    run_btn.click(
-        fn=run_edit,
-        inputs=[src_img, src_prompt, tgt_prompt, resolution, gt_fix, cfg_scale, seed, mask_img],
-        outputs=[output_img, status_box],
-    )
+        with gr.Column():
+            editor = gr.ImageEditor(label="Input image", type="numpy", height=512,
+                                    brush=gr.Brush(colors=["#ff0000"], default_size=40))
+            backbone = gr.Dropdown(list(BACKBONES), value="Switti", label="Backbone")
+            method = gr.Dropdown(BACKBONES["Switti"], value="MLN (ours)", label="Method")
+            reso = gr.Radio(["512", "1024"], value="512", label="Resolution (px)")
+            src = gr.Textbox(label="Source prompt (describes the input)", value="a cat sitting on a wooden table")
+            tgt = gr.Textbox(label="Target prompt (describes the edit)", value="a dog sitting on a wooden table")
+            seed = gr.Number(42, label="Seed", precision=0)
+            go = gr.Button("Edit", variant="primary")
+        with gr.Column():
+            result = gr.Image(label="Edited image")
+            info = gr.Markdown()
+    backbone.change(on_backbone, backbone, [method, reso])
+    method.change(on_method, method, reso)
+    go.click(run, [editor, method, reso, src, tgt, seed], [result, info], api_name="edit")
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--share", action="store_true")
+    ap.add_argument("--port", type=int, default=7860)
+    a = ap.parse_args()
+    demo.queue(max_size=8).launch(server_name="0.0.0.0", server_port=a.port, share=a.share, show_error=True)
